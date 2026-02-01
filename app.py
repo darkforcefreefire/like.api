@@ -60,10 +60,16 @@ class CredentialManager:
             elif server_name in {"BR", "US", "SAC", "NA"}:
                 filename = "br.json"
             else:
-                filename = "sg.json"
+                # For SG server, use the tokens-SG.json file
+                filename = "tokens-SG.json"
             
             with open(filename, "r") as f:
                 credentials = json.load(f)
+                # Ensure all credentials have both uid and password for backward compatibility
+                for cred in credentials:
+                    if 'password' not in cred:
+                        # If password is missing, add a dummy one (won't be used for JWT)
+                        cred['password'] = "dummy_password"
                 self.credentials_cache[server_name] = credentials
                 log_info(f"Loaded {len(credentials)} credentials for server {server_name}.")
                 return credentials
@@ -100,6 +106,40 @@ class CredentialManager:
             
             return batch
 
+def get_direct_jwt_token(uid, password=None, server_name=None):
+    """
+    Gets a pre-existing JWT token from the credentials file for SG server.
+    Uses stale-while-revalidate cache strategy for token freshness.
+    """
+    if server_name != "SG":
+        # For non-SG servers, fall back to the original method
+        return get_jwt_token(uid, password)
+    
+    now = time.time()
+    cached_token_info = TOKEN_CACHE.get(uid)
+    
+    # 1. If a fresh token exists, return it immediately
+    if cached_token_info and now < cached_token_info['expires_at']:
+        return cached_token_info['token']
+    
+    # 2. Token is stale or absent. Look for it in credentials
+    credentials = credential_manager.load_credentials(server_name)
+    if not credentials:
+        return None
+    
+    # Find the credential with matching UID
+    for cred in credentials:
+        if str(cred.get('uid')) == str(uid) and 'jwt_token' in cred:
+            token = cred['jwt_token']
+            # Cache the token with expiration
+            TOKEN_CACHE[uid] = {'token': token, 'expires_at': now + TOKEN_EXPIRATION_SECONDS}
+            log_info(f"Using pre-existing JWT token for UID: {uid}")
+            return token
+    
+    # If no pre-existing token found, fall back to generation
+    log_warning(f"No pre-existing JWT token found for UID: {uid}, falling back to generation")
+    return get_jwt_token(uid, password)
+    
 # --- JWT Generation and Caching ---
 import my_pb2
 import output_pb2
@@ -294,14 +334,25 @@ async def send_multiple_requests(uid, server_name, url):
         tasks = []
         async with aiohttp.ClientSession() as session:
             for cred in credential_batch:
-                token = get_jwt_token(cred['uid'], cred['password'])
+                # For SG server, try to use direct JWT token first
+                if server_name == "SG" and 'jwt_token' in cred:
+                    token = cred['jwt_token']
+                    # Cache it for future use
+                    TOKEN_CACHE[cred['uid']] = {
+                        'token': token, 
+                        'expires_at': time.time() + TOKEN_EXPIRATION_SECONDS
+                    }
+                else:
+                    # Fall back to the original method
+                    token = get_jwt_token(cred['uid'], cred.get('password', 'dummy_password'))
+                
                 if token:
                     tasks.append(send_request(session, encrypted_uid, token, url))
                 else:
-                    log_warning(f"Could not generate token for UID: {cred['uid']}. Skipping.")
+                    log_warning(f"Could not get token for UID: {cred['uid']}. Skipping.")
 
             if not tasks:
-                log_error("No valid JWT tokens could be generated for the batch.")
+                log_error("No valid JWT tokens could be obtained for the batch.")
                 return None
             
             log_info(f"Sending a batch of {len(tasks)} like requests for UID {uid}.")
@@ -370,10 +421,20 @@ def handle_requests():
         initial_credentials = credential_manager.load_credentials(server_name)
         if not initial_credentials:
             return jsonify({"error": f"Failed to load credentials for {server_name}."}), 500
-
-        token = get_jwt_token(initial_credentials[0]['uid'], initial_credentials[0]['password'])
+        
+        # Get token - use direct JWT for SG server
+        if server_name == "SG" and 'jwt_token' in initial_credentials[0]:
+            token = initial_credentials[0]['jwt_token']
+            # Cache it
+            TOKEN_CACHE[initial_credentials[0]['uid']] = {
+                'token': token, 
+                'expires_at': time.time() + TOKEN_EXPIRATION_SECONDS
+            }
+        else:
+            token = get_jwt_token(initial_credentials[0]['uid'], initial_credentials[0].get('password', 'dummy_password'))
+        
         if not token:
-            return jsonify({"error": "Failed to generate initial JWT token."}), 500
+            return jsonify({"error": "Failed to obtain JWT token."}), 500
 
         encrypted_uid = enc(uid)
         if not encrypted_uid:
