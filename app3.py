@@ -60,7 +60,7 @@ class CredentialManager:
             elif server_name in {"BR", "US", "SAC", "NA"}:
                 filename = "br.json"
             else:
-                filename = "bd.json"
+                filename = "sg.json"
             
             with open(filename, "r") as f:
                 credentials = json.load(f)
