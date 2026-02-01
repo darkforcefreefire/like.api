@@ -51,6 +51,10 @@ class CredentialManager:
 
     def load_credentials(self, server_name):
         """Loads credentials for a server from JSON files if not already in cache."""
+        # Forcing reload for SG to ensure freshness during debug, or keep cache logic
+        # if server_name == "SG" and server_name in self.credentials_cache:
+        #    return self.credentials_cache[server_name]
+        
         if server_name in self.credentials_cache:
             return self.credentials_cache[server_name]
 
@@ -312,7 +316,7 @@ async def send_request(session, encrypted_uid, token, url):
         }
         async with session.post(url, data=edata, headers=headers) as response:
             if response.status != 200:
-                log_error(f"Request failed with status code: {response.status}")
+                # log_error(f"Request failed with status code: {response.status}")
                 return response.status
             return await response.text()
     except Exception as e:
@@ -391,7 +395,7 @@ def make_request(encrypt, server_name, token):
             'Accept-Encoding': "gzip", 'Authorization': f"Bearer {token}", 'Content-Type': "application/x-www-form-urlencoded",
             'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': "OB50"
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False)
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
         binary_content = response.content
         return decode_protobuf(binary_content)
     except Exception as e:
@@ -417,33 +421,70 @@ def handle_requests():
         return jsonify({"error": "UID and server_name are required"}), 400
 
     try:
-        # Use one credential for initial check
-        initial_credentials = credential_manager.load_credentials(server_name)
-        if not initial_credentials:
+        credentials = credential_manager.load_credentials(server_name)
+        if not credentials:
             return jsonify({"error": f"Failed to load credentials for {server_name}."}), 500
-        
-        # Get token - use direct JWT for SG server
-        if server_name == "SG" and 'jwt_token' in initial_credentials[0]:
-            token = initial_credentials[0]['jwt_token']
-            # Cache it
-            TOKEN_CACHE[initial_credentials[0]['uid']] = {
-                'token': token, 
-                'expires_at': time.time() + TOKEN_EXPIRATION_SECONDS
-            }
-        else:
-            token = get_jwt_token(initial_credentials[0]['uid'], initial_credentials[0].get('password', 'dummy_password'))
-        
-        if not token:
-            return jsonify({"error": "Failed to obtain JWT token."}), 500
 
         encrypted_uid = enc(uid)
         if not encrypted_uid:
             return jsonify({"error": "Encryption of UID failed."}), 500
 
-        # Get player data before sending likes
-        before_proto = make_request(encrypted_uid, server_name, token)
-        if not before_proto:
-            return jsonify({"error": "Failed to retrieve initial player info."}), 500
+        # --- FIX STARTS HERE ---
+        # Logic to find a working account to check player stats.
+        # Instead of relying only on the first account (which might be banned or glitchy),
+        # we loop through the first few accounts until we get a valid response.
+        
+        before_proto = None
+        working_token = None
+        
+        # Try up to 10 accounts to get the initial info
+        attempts = 0
+        max_attempts = 10
+        
+        for cred in credentials:
+            if attempts >= max_attempts:
+                break
+            
+            try:
+                # Get token for this specific credential
+                if server_name == "SG" and 'jwt_token' in cred:
+                    current_token = cred['jwt_token']
+                else:
+                    current_token = get_jwt_token(cred['uid'], cred.get('password', 'dummy_password'))
+                
+                if not current_token:
+                    attempts += 1
+                    continue
+
+                # Try to get player info
+                temp_proto = make_request(encrypted_uid, server_name, current_token)
+                
+                if temp_proto:
+                    # Check if the response actually contains valid data (AccountInfo)
+                    try:
+                        data_check = json.loads(MessageToJson(temp_proto))
+                        if 'AccountInfo' in data_check:
+                            before_proto = temp_proto
+                            working_token = current_token
+                            
+                            # Cache this token as it is confirmed working
+                            TOKEN_CACHE[cred['uid']] = {
+                                'token': current_token, 
+                                'expires_at': time.time() + TOKEN_EXPIRATION_SECONDS
+                            }
+                            log_info(f"Found working checking account: {cred['uid']}")
+                            break
+                    except:
+                        pass # Json parse failed, try next
+                
+            except Exception as e:
+                log_debug(f"Attempt with uid {cred.get('uid')} failed: {e}")
+            
+            attempts += 1
+
+        if not before_proto or not working_token:
+            return jsonify({"error": "Failed to retrieve initial player info. All checking accounts failed."}), 500
+        # --- FIX ENDS HERE ---
         
         data_before = json.loads(MessageToJson(before_proto))
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0))
@@ -460,10 +501,14 @@ def handle_requests():
         # Send the batch of likes
         asyncio.run(send_multiple_requests(uid, server_name, url))
 
-        # Get player data after sending likes
-        after_proto = make_request(encrypted_uid, server_name, token)
+        # Get player data after sending likes (reuse the working token found above)
+        after_proto = make_request(encrypted_uid, server_name, working_token)
         if not after_proto:
-            return jsonify({"error": "Failed to retrieve player info after sending likes."}), 500
+            # Try one more time if the first check failed (rare)
+            time.sleep(0.5)
+            after_proto = make_request(encrypted_uid, server_name, working_token)
+            if not after_proto:
+                return jsonify({"error": "Failed to retrieve player info after sending likes."}), 500
         
         data_after = json.loads(MessageToJson(after_proto))
         after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
